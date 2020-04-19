@@ -3,6 +3,82 @@
 #include "Nextion.h"
 #include "INextionTouchable.h"
 
+
+void NextionMsgLst::enqMsg(Buffer &buffer)
+{
+  if (buffer[0] == NEX_RET_EVENT_TOUCH_HEAD)
+  {
+    //printf("Push Touch Event %d %d %d\n", int(buffer[1]), int(buffer[2]), int(buffer[3]));
+    uint8_t nwr = ewr+1;
+    if (nwr >= NextionMsgLstEvts)
+      nwr = 0;
+    if ((nwr == erd) && elw)	// Full ??
+    {
+      printf("Touch Event Queue FULL!!\n");
+      return;
+    }
+    Evt[ewr].page = buffer[1];
+    Evt[ewr].cmpnt = buffer[2];
+    Evt[ewr].event = NextionEventType(buffer[3]);
+    ewr=nwr;
+    elw = true;
+  }
+  else
+  {
+    if (NextionValue(buffer[0]) <= NEX_RET_VAR_NAME_TOO_LONG)
+    {
+      //printf("Don't push message 0x%02x!\n", int(buffer[0])); //as cmd [n]ack are not meanfull out of context!
+      return;
+    }
+    printf("Push Msg 0x%02x\n", int(buffer[0]));
+    uint8_t nwr = mwr+1;
+    if (nwr >= NextionMsgLstMsgs)
+      nwr = 0;
+    if ((nwr == mrd) && mlw)	// Full ??
+    {
+      printf("Msg Queue FULL!!\n");
+      return;
+    }
+    Msg[mwr].msg = NextionValue(buffer[0]);
+    Msg[mwr].str = buffer.substring(1, buffer.length() - 3);
+    Msg[mwr].datalen = Msg[mwr].str.length();
+    mwr=nwr;
+    mlw = true;
+  }
+}
+
+bool NextionMsgLst::haveEvt(void)
+{
+  return (erd != ewr) || elw;
+}
+
+bool NextionMsgLst::haveMsg(void)
+{
+  return (mrd != mwr) || mlw;
+}
+
+NextionMsg *NextionMsgLst::deqMsg(void)
+{
+  if (!haveMsg())
+    return NULL;
+  NextionMsg *msg = &Msg[mrd++];
+  if (mrd >= NextionMsgLstMsgs)
+    mrd = 0;
+  mlw = false;
+  return msg;
+}
+
+NextionEvt *NextionMsgLst::deqEvt(void)
+{
+  if (!haveEvt())
+    return NULL;
+  NextionEvt *evt = &Evt[erd++];
+  if (erd >= NextionMsgLstEvts)
+    erd = 0;
+  elw = false;
+  return evt;
+}
+
 /*!
  * \brief Creates a new device driver.
  * \param stream Stream (serial port) the device is connected to
@@ -14,6 +90,7 @@ Nextion::Nextion(Stream &stream, bool flushSerialBeforeTx)
     , m_timeout(500)
     , m_flushSerialBeforeTx(flushSerialBeforeTx)
     , m_touchableList(NULL)
+    , m_function2(NULL)
 {
   m_serialPort.setTimeout(m_timeout);
 }
@@ -24,13 +101,15 @@ Nextion::Nextion(Stream &stream, bool flushSerialBeforeTx)
  */
 bool Nextion::init()
 {
-  sendCommand("");
+  sendCommand("");	// Generate a EOF marker to reset device cmd parser
 
-  sendCommand("bkcmd=1");
+  sendCommand("bkcmd=3");
   bool result1 = checkCommandComplete();
 
   sendCommand("page 0");
   bool result2 = checkCommandComplete();
+
+  MsgLst.Purge();
 
   return (result1 && result2);
 }
@@ -40,36 +119,58 @@ bool Nextion::init()
  */
 void Nextion::poll()
 {
-  while (m_serialPort.available() > 0)
+  while (MsgLst.haveEvt() || MsgLst.haveMsg() || enqueuMsg())
   {
-    char c = m_serialPort.read();
-
-    if (c == NEX_RET_EVENT_TOUCH_HEAD)
+    NextionMsg *Msg = MsgLst.deqMsg();
+    if (Msg)
     {
-      delay(10);
+      ; //printf("Drop Msg 0x%02x\n", int(Msg->msg));
+    }
 
-      if (m_serialPort.available() >= 6)
+    NextionEvt *Evt = MsgLst.deqEvt();
+    if (Evt)
+    {
+      printf("Dispatch event 0x%02x on %d.%d\n", int(Evt->event), int(Evt->page), int(Evt->cmpnt));
+      ITouchableListItem *item = m_touchableList;
+      while (item != NULL)
       {
-        static uint8_t buffer[8];
-        buffer[0] = c;
-
-        uint8_t i;
-        for (i = 1; i < 7; i++)
-          buffer[i] = m_serialPort.read();
-        buffer[i] = 0x00;
-
-        if (buffer[4] == 0xFF && buffer[5] == 0xFF && buffer[6] == 0xFF)
-        {
-          ITouchableListItem *item = m_touchableList;
-          while (item != NULL)
-          {
-            item->item->processEvent(buffer[1], buffer[2], buffer[3]);
-            item = item->next;
-          }
-        }
+	if (item->item->processEvent(Evt->page, Evt->cmpnt, Evt->event))
+	  break;
+	item = item->next;
+      }
+      if ((!item) && (m_function2))
+      {
+	m_function2(Evt->event, Evt->page, Evt->cmpnt);
       }
     }
   }
+}
+/*!
+ * \brief Attaches a callback function to this widget.
+ * \param function Pointer to callback function
+ * \return True if successful
+ * \see INextionTouchable::detachCallback
+ */
+bool Nextion::attachFunction(NextionFunction2 fct)
+{
+  if (!fct)
+    return false;
+
+  if (m_function2 != NULL)
+    detachFunction();
+
+  m_function2 = fct;
+  return true;
+}
+
+/*!
+ * \brief Removes the callback handler from this widget
+ *
+ * Memory is not freed.
+ */
+void Nextion::detachFunction()
+{
+  m_function2 = NULL;
 }
 
 /*!
@@ -154,14 +255,12 @@ uint8_t Nextion::getCurrentPage()
 {
   sendCommand("sendme");
 
-  uint8_t temp[5] = {0};
-
-  if (sizeof(temp) != m_serialPort.readBytes((char *)temp, sizeof(temp)))
-    return 0;
-
-  if (temp[0] == NEX_RET_CURRENT_PAGE_ID_HEAD && temp[2] == 0xFF &&
-      temp[3] == 0xFF && temp[4] == 0xFF)
-    return temp[1];
+  Buffer msg;
+  if (searchMsg(NEX_RET_CURRENT_PAGE_ID_HEAD, msg))
+  {
+    return (const uint8_t)msg[1];
+  }
+  printf("Can't get current page !!!\n");
 
   return 0;
 }
@@ -319,6 +418,7 @@ void Nextion::registerTouchable(INextionTouchable *touchable)
  */
 void Nextion::sendCommand(const String &command)
 {
+  /*
   if (m_flushSerialBeforeTx)
   {
     while(m_serialPort.available())
@@ -326,11 +426,14 @@ void Nextion::sendCommand(const String &command)
       m_serialPort.read();
     }
   }
+  */
 
   m_serialPort.print(command);
   m_serialPort.write(0xFF);
   m_serialPort.write(0xFF);
   m_serialPort.write(0xFF);
+
+  //printf("Command '%s' sent\n", command.c_str());
 }
 
 void Nextion::sendCommand(const char *format, ...)
@@ -354,26 +457,30 @@ void Nextion::sendCommand(const char *format, va_list args)
  */
 bool Nextion::checkCommandComplete()
 {
-  bool ret = false;
-  uint8_t temp[4] = {0};
-  uint8_t bytesRead = m_serialPort.readBytes((char *)temp, sizeof(temp));
+  uint32_t deadline = millis() + m_timeout;
+  Buffer msg;
+  do
+  {
+    if (receiveMsg(msg, deadline))
+    {
+      NextionValue hdr = NextionValue(msg[0]);
+      if (hdr == NEX_RET_CMD_FINISHED) 
+      {
+	//printf("Command OK\n");
+	return true;
+      }
+      else if (hdr <= NEX_RET_VAR_NAME_TOO_LONG)
+      {
+	printf("Nextion::checkCommandComplete, error 0x%02X\n", int(hdr));
+	return false;
+      }
+      else
+	MsgLst.enqMsg(msg);
+    }
+  } while (millis() < deadline);
+  printf("Command without answer\n");
 
-  if (bytesRead != sizeof(temp))
-  {
-    printf("\nNextion::checkCommandComplete, not enough data available: %d vs %d\n",
-      bytesRead, sizeof(temp));
-  }
-  if (temp[0] == NEX_RET_CMD_FINISHED && temp[1] == 0xFF && temp[2] == 0xFF && temp[3] == 0xFF)
-  {
-    ret = true;
-  }
-  else
-  {
-    printf("\nNextion::checkCommandComplete, incomplete command?: %02x %02x %02x %02x\n",
-      temp[0], temp[1], temp[2], temp[3]);
-  }
-
-  return ret;
+  return false;
 }
 
 /*!
@@ -383,20 +490,17 @@ bool Nextion::checkCommandComplete()
  */
 bool Nextion::receiveNumber(uint32_t *number)
 {
-  uint8_t temp[8] = {0};
-
   if (!number)
     return false;
 
-  if (sizeof(temp) != m_serialPort.readBytes((char *)temp, sizeof(temp)))
-    return false;
-
-  if (temp[0] == NEX_RET_NUMBER_HEAD && temp[5] == 0xFF && temp[6] == 0xFF &&
-      temp[7] == 0xFF)
+  Buffer msg;
+  if (searchMsg(NEX_RET_NUMBER_HEAD, msg))
   {
-    *number = (uint32_t(temp[4]) << 24) | (uint32_t(temp[3]) << 16) | (temp[2] << 8) | (temp[1]);
+    const uint8_t *temp = (const uint8_t*)msg.begin();
+    *number = (uint32_t(temp[4]) << 24) | (uint32_t(temp[3]) << 16) | (uint16_t(temp[2]) << 8) | (temp[1]);
     return true;
   }
+  printf("Can't get INTEGER\n");
 
   return false;
 }
@@ -408,54 +512,207 @@ bool Nextion::receiveNumber(uint32_t *number)
  */
 size_t Nextion::receiveString(String &buffer, bool stringHeader)
 {
-  bool have_header_flag = !stringHeader;
-  uint8_t flag_count = 0;
-  uint32_t start = millis();
-  buffer.reserve(128);
-  while (millis() - start <= m_timeout)
+  Buffer msg;
+  if (searchMsg(NEX_RET_NUMBER_HEAD, msg))
   {
-    while (m_serialPort.available())
-    {
-      uint8_t c = m_serialPort.read();
-      if (!have_header_flag && c == NEX_RET_STRING_HEAD)
-      {
-        have_header_flag = true;
-      }
-      else if (have_header_flag)
-      {
-        if (c == NEX_RET_CMD_FINISHED)
-        {
-          // it appears that we received a "previous command completed successfully"
-          // response. Discard the next three bytes which will be 0xFF so we can
-          // advance to the actual response we are wanting.
-          m_serialPort.read();
-          m_serialPort.read();
-          m_serialPort.read();
-        }
-        else if (c == 0xFF)
-        {
-          flag_count++;
-        }
-        else if (c == 0x05 && !stringHeader)
-        {
-          // this is a special case for the "connect" command
-          flag_count = 3;
-        }
-        else if (c < 0x20 || c > 0x7F)
-        {
-          // discard non-printable character
-        }
-        else
-        {
-          buffer.concat((char)c);
-        }
-      }
-    }
+    buffer = msg.substring(1,msg.length()-3).c_str();
+    return buffer.length();
+  }
+  printf("Can't get STRING\n");
+  return 0;
+}
 
-    if (flag_count >= 3) {
-      break;
+/*
+void Nextion::enqueu(void)
+{
+  uint32_t deadline =  millis() + m_timeout;
+  Buffer msg;
+  while (receiveMsg(msg, deadline))
+  {
+    MsgLst.enqMsg(msg);
+  }
+}
+*/
+
+bool Nextion::enqueuMsg(void)
+{
+  //printf("Nextion::enqueuMsg...\n");
+  Buffer msg;
+  uint32_t deadline = millis()+5;
+  if (receiveMsg(msg, deadline))
+  {
+    MsgLst.enqMsg(msg);
+    return true;
+  }
+  return false;
+}
+
+
+uint8_t NextionParser::getMsgLen(uint8_t hdr)
+{
+  switch (hdr)
+  {
+    case NEX_RET_INVALID_CMD: return(4+2);	// mays be 1+3 (invalid command) or 3+3 (Startup) , take longer one
+    case NEX_RET_EVENT_TOUCH_HEAD: return(4+3);
+    case NEX_RET_CURRENT_PAGE_ID_HEAD: return(4+1);
+    case NEX_RET_EVENT_POSITION_HEAD:
+    case NEX_RET_EVENT_SLEEP_POSITION_HEAD: return(4+5);
+    case NEX_RET_STRING_HEAD: return(0);	// Variable
+    case NEX_RET_NUMBER_HEAD: return(4+4);	// May generate false EOF
+    default: return(4+0);
+  }
+}
+
+bool Nextion::searchMsg(NextionValue value, Buffer &msg, uint32_t deadline)
+{
+  if (!deadline)
+    deadline = millis() + m_timeout;
+  do
+  {
+    if (receiveMsg(msg, deadline))
+    {
+      if (NextionValue(msg[0]) == value)
+      {
+	//printf("Found message type 0x%02x\n", value);
+	return true;
+      }
+      MsgLst.enqMsg(msg);
+    }
+  } while (millis() < deadline);
+  printf("Nextion::searchMsg(0x%02x): can't find message !!\r\n", int(value));
+  return false;
+}
+
+void dumpit(const Buffer &buf)
+{
+  printf("Msg(%d): ", buf.length());
+  for (uint8_t i = 0; i < buf.length(); ++i)
+    printf("%02X ", buf[i] & 0xFF);
+  printf("\n\r");
+}
+
+
+// 0xFF 0xFF 0xFF is the EOF (end of frame) marker. This marker can not be present in the message content except
+// for Numeric Data message (0x71) where we can get up to four consecutive 0xff before the EOF marker.
+bool Nextion::receiveMsg(Buffer &msg, uint32_t deadline)
+{
+  if (!deadline)
+    deadline =  millis() + m_timeout;
+
+  return m_Parser.receiveMsg(m_serialPort, msg, deadline);
+}
+
+bool NextionParser::receiveMsg(Stream &serialPort, Buffer &msg, uint32_t deadline)
+{
+  // Handle pending message
+  do {
+    if (parsePos(msg, currPos))	// In the loop because parse may "generate" message in reparsing bad one ???
+      return true;
+
+    while (serialPort.available())
+    {
+      m_buffer.concat(char(serialPort.read()));
+      if (parsePos(msg, currPos))
+	return true;
+    }
+  } while (millis() <= deadline);
+
+  if (m_buffer.length())
+  {
+    //printf("NextionParse::receiveMsg(): remind  bytes in buffer : "); dumpit(m_buffer);
+  }
+
+  return false;
+}
+
+// 0xFF 0xFF 0xFF is the EOF (end of frame) marker. This marker can not be present in the message content except
+// for Numeric Data message (0x71) where we can get up to four consecutive 0xff before the EOF marker.
+bool NextionParser::parsePos(Buffer &msg, uint8_t startPos)
+{
+  uint8_t pos = startPos;
+  while (pos < m_buffer.length())
+  {
+    uint8_t c = m_buffer[pos];
+    if (!pos)
+    {
+      if (c == 0xFF)	// 0xFF can't be a header
+      {
+	printf("\nNextionParser::parse(): should not have message type 0xFF!!\n");
+	m_buffer.remove(0,1);
+	continue;
+      }
+      hdr = c;
+      maxlen = getMsgLen(hdr);
+      if (maxlen)
+	m_buffer.reserve(maxlen);
+      else
+	m_buffer.reserve(64);	// base for strings
+    }
+    else
+    {
+      if (c == 0xFF)
+	flag_count++;
+      else 
+	flag_count = 0;
+    }
+    pos++;
+
+    while (flag_count == 3) // Got a EOF
+    {
+      uint8_t blen  = pos;	// block len
+      if ((hdr == NEX_RET_NUMBER_HEAD) && (blen < maxlen)) // Handle exception of NUMERIC value where EOF may not be where we want
+      {
+	flag_count--; // Remove a false 0xFF marker
+	break;
+      }
+
+      if ((hdr == NEX_RET_INVALID_CMD) && (blen >= (1+3))) 	// Alternative length for thr Msg header
+	maxlen=(1+3);	// now it's my len
+
+      if (!maxlen) // no limit, i.e. STRING
+	maxlen=blen; // length is current one
+
+      if (blen == maxlen) // theorical length == pratical length
+      {
+	if (maxlen == m_buffer.length())
+	  msg = m_buffer;
+	else
+	  msg = m_buffer.substring(0, maxlen);
+	m_buffer.remove(0,maxlen);
+	currPos = 0;
+	flag_count = 0;
+	//printf("Got message : "); dumpit(msg);
+	return true;
+      }
+
+      // shoud not appen in perfect world: now we have a problem. We must to find a solution.
+      // Then first char is not a header and drop it
+      if (blen <= 4)	// a message must have four char minimum including EOF marker then drop this garbage
+      {
+	printf("\nNextionParser::parse(): too short: drop corrupted message!! "); dumpit(m_buffer);
+	m_buffer.remove(0,blen);
+	pos = 0;
+	flag_count = 0;
+      }
+      else	// reevaluate with new header and shorter message
+      {
+	printf("\nNextionParser::parser(): bad size: drop header of malformed message!! "); dumpit(m_buffer);
+	m_buffer.remove(0,1);	// remove false header
+	pos--;			// we are shorter
+	hdr = m_buffer[0];	// new header
+	maxlen=getMsgLen(hdr);	// and new expected message size
+      }
+    } // while EOF
+    if ((maxlen != 0) && (pos >= maxlen))	// We should have reach EOF here !!
+    {
+      printf("\nNextionParser::parser(): tool long : drop header of malformed message!!"); dumpit(m_buffer);
+      m_buffer.remove(0,1);	// remove false header
+      pos--;			// we are shorter
+      hdr = m_buffer[0];	// new header
+      maxlen=getMsgLen(hdr);	// and new expected message size
     }
   }
-  buffer.trim();
-  return buffer.length();
+  currPos = pos;
+
+  return false;
 }

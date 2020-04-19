@@ -1,5 +1,3 @@
-/*! \file */
-
 #ifndef __NEONEXTION_NEXTION
 #define __NEONEXTION_NEXTION
 
@@ -11,10 +9,15 @@ extern char *itoa(int a, char *buffer, unsigned char radix);
 #endif
 
 #include <WString.h>
+#include <WBuffer.h>
 
 #include "NextionTypes.h"
 
+#include <LibPrintf.h>
+
+
 class INextionTouchable;
+class Nextion;
 
 /*!
  * \struct ITouchableListItem
@@ -26,13 +29,79 @@ struct ITouchableListItem
   ITouchableListItem *next; //!< Pointer to next list node
 };
 
+
+/*
+ *
+ *
+ */
+
+struct NextionEvt{
+  uint8_t page;
+  uint8_t cmpnt;
+  NextionEventType event;
+};
+struct NextionMsg
+{
+  NextionValue msg;
+  uint8_t datalen;
+  Buffer str;
+
+  NextionMsg() : msg(NEX_RET_INVALID_CMD), datalen(0) {}
+  ~NextionMsg() { datalen=0;}
+  //uint8_t& operator [](uint8_t idx) { if (idx >= datalen) return buf[datalen-1]; return buf[idx]; }
+};
+
+struct NextionParser
+{
+  bool have_header_flag;
+  uint8_t hdr;
+  uint8_t maxlen;
+  uint8_t flag_count;
+  uint8_t currPos;
+  Buffer m_buffer;
+
+  bool receiveMsg(Stream &serialPort, Buffer &msg, uint32_t deadline);
+  bool parsePos(Buffer &msg, uint8_t startPos);
+  //bool parseChar(Buffer &msg, uint8_t c);
+  void clear(void) { have_header_flag=0; hdr = currPos = maxlen = flag_count = 0; m_buffer.clear(); };
+  uint8_t getMsgLen(uint8_t hdr);
+};
+
+
+
+const int NextionMsgLstEvts = 8;
+const int NextionMsgLstMsgs = 8;
+struct NextionMsgLst
+{
+  NextionEvt Evt[NextionMsgLstEvts];
+  NextionMsg Msg[NextionMsgLstMsgs];
+  uint8_t erd, ewr;
+  uint8_t mrd, mwr;
+  bool elw, mlw;
+  NextionMsgLst() : erd(0), ewr(0), mrd(0), mwr(0), elw(false), mlw(false) { }
+  //~NextionMsgLst() { }
+  void purgeEvt(void) { erd=ewr=0; elw=false;}
+  void purgeMsg(void) { mrd=mwr=0; mlw=false;}
+  void Purge(void) {purgeEvt(); purgeMsg();}
+  void enqMsg(Buffer &);
+  NextionMsg *deqMsg(void);
+  NextionEvt *deqEvt(void);
+  bool haveEvt(void);
+  bool haveMsg(void);
+};
+
+
+
 /*!
  * \class Nextion
  * \brief Driver for a physical Nextion device.
  */
 class Nextion
 {
+  friend NextionMsgLst;
 public:
+  typedef void (*NextionFunction2)(NextionEventType, uint8_t page, uint8_t component);
+  
   Nextion(Stream &stream, bool flushSerialBeforeTx = true);
 
   bool init();
@@ -44,6 +113,7 @@ public:
   bool sleep();
   bool wake();
 
+  bool setGlobal(const String &objectName, uint32_t );
   uint16_t getBrightness();
   bool setBrightness(uint16_t val, bool persist = false);
 
@@ -71,12 +141,25 @@ public:
   bool checkCommandComplete();
   bool receiveNumber(uint32_t *number);
   size_t receiveString(String &buffer, bool stringHeader=true);
+  
+  bool attachFunction(NextionFunction2 fct);
+  void detachFunction();
 
+  NextionMsgLst	MsgLst;
+
+  bool receiveMsg(Buffer &msg, uint32_t deadline = 0);
+  bool searchMsg(NextionValue value, Buffer &msg, uint32_t deadline = 0);
+  //void enqueu(void);
 private:
   Stream &m_serialPort;       //!< Serial port device is attached to
   uint32_t m_timeout;         //!< Serial communication timeout in ms
   bool m_flushSerialBeforeTx; //!< Flush serial port before transmission
   ITouchableListItem *m_touchableList; //!< LInked list of INextionTouchable
+  NextionFunction2 m_function2; //!< Default callback
+  
+  NextionParser m_Parser;
+  bool enqueuMsg(void);
+
 };
 
 #endif
