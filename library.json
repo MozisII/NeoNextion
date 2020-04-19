@@ -26,5 +26,5 @@
     }
   ],
   "frameworks": "arduino",
-  "platforms": ["espressif32"]
+  "platforms": ["espressif32","atmelavr"]
 }
