@@ -7,7 +7,7 @@
  */
 NextionPage::NextionPage(Nextion &nex, uint8_t page, uint8_t component,
                          const String &name)
-    : INextionWidget(nex, page, component, name)
+    : INextionWidget(nex, page, 0, name)
 {
 }
 
@@ -17,6 +17,7 @@ NextionPage::NextionPage(Nextion &nex, uint8_t page, uint8_t component,
  */
 bool NextionPage::show()
 {
+  m_nextion.MsgLst.purgeEvt();	// touchable events are no more meanfull
   return sendCommandWithWait("page %s", m_name.c_str());
 }
 
