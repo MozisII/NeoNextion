@@ -214,6 +214,17 @@ bool Nextion::wake()
   return checkCommandComplete();
 }
 
+bool Nextion::setGlobal(const String &varName, uint32_t number)
+{
+  sendCommand("%s=%lu", varName.c_str(), number);
+  return checkCommandComplete();
+}
+
+bool Nextion::getGlobal(const String &varName, uint32_t *number)
+{
+  sendCommand("get %s", varName.c_str());
+  return receiveNumber(number);
+}
 /*!
  * \brief Gets the current backlight brightness.
  * \return Brightness

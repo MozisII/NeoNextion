@@ -113,7 +113,9 @@ public:
   bool sleep();
   bool wake();
 
-  bool setGlobal(const String &objectName, uint32_t );
+  bool setGlobal(const String &varName, uint32_t number);
+  bool getGlobal(const String &varName, uint32_t *number);
+
   uint16_t getBrightness();
   bool setBrightness(uint16_t val, bool persist = false);
 
