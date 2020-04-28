@@ -86,7 +86,8 @@ NextionEvt *NextionMsgLst::deqEvt(void)
  *                            transmission
  */
 Nextion::Nextion(Stream &stream, bool flushSerialBeforeTx)
-    : m_serialPort(stream)
+    : m_defPage(0)
+    , m_serialPort(stream)
     , m_timeout(500)
     , m_flushSerialBeforeTx(flushSerialBeforeTx)
     , m_touchableList(NULL)
@@ -106,7 +107,7 @@ bool Nextion::init()
   sendCommand("bkcmd=3");
   bool result1 = checkCommandComplete();
 
-  sendCommand("page 0");
+  sendCommand("page %d",m_defPage);
   bool result2 = checkCommandComplete();
 
   MsgLst.Purge();

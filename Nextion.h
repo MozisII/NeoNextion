@@ -152,6 +152,8 @@ public:
   bool receiveMsg(Buffer &msg, uint32_t deadline = 0);
   bool searchMsg(NextionValue value, Buffer &msg, uint32_t deadline = 0);
   //void enqueu(void);
+
+  int m_defPage;
 private:
   Stream &m_serialPort;       //!< Serial port device is attached to
   uint32_t m_timeout;         //!< Serial communication timeout in ms
